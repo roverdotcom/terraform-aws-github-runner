@@ -3,11 +3,12 @@ import { createChildLogger } from '@aws-github-runner/aws-powertools-util';
 import moment from 'moment';
 
 import { createGithubAppAuth, createGithubInstallationAuth, createOctokitClient } from '../github/auth';
-import { bootTimeExceeded, listEC2Runners, tag, terminateRunner } from './../aws/runners';
-import { RunnerInfo, RunnerList } from './../aws/runners.d';
+import { bootTimeExceeded, hibernateRunner, listEC2Runners, tag, terminateRunner } from './../aws/runners';
+import { RunnerInfo } from './../aws/runners.d';
 import { GhRunners, githubCache } from './cache';
 import { ScalingDownConfig, getEvictionStrategy, getIdleRunnerCount } from './scale-down-config';
 import { metricGitHubAppRateLimit } from '../github/rate-limit';
+import yn from 'yn';
 
 const logger = createChildLogger('scale-down');
 
@@ -103,39 +104,65 @@ function runnerMinimumTimeExceeded(runner: RunnerInfo): boolean {
   return launchTimePlusMinimum < now;
 }
 
-async function removeRunner(ec2runner: RunnerInfo, ghRunnerIds: number[]): Promise<void> {
+async function removeRunner(ec2runner: RunnerInfo, ghRunnerIds: number[], ephemeral: boolean): Promise<void> {
   const githubAppClient = await getOrCreateOctokit(ec2runner);
   try {
     const states = await Promise.all(
       ghRunnerIds.map(async (ghRunnerId) => {
-        // Get busy state instead of using the output of listGitHubRunners(...) to minimize to race condition.
         return await getGitHubRunnerBusyState(githubAppClient, ec2runner, ghRunnerId);
       }),
     );
 
     if (states.every((busy) => busy === false)) {
-      const statuses = await Promise.all(
-        ghRunnerIds.map(async (ghRunnerId) => {
-          return (
-            ec2runner.type === 'Org'
-              ? await githubAppClient.actions.deleteSelfHostedRunnerFromOrg({
-                  runner_id: ghRunnerId,
-                  org: ec2runner.owner,
-                })
-              : await githubAppClient.actions.deleteSelfHostedRunnerFromRepo({
-                  runner_id: ghRunnerId,
-                  owner: ec2runner.owner.split('/')[0],
-                  repo: ec2runner.owner.split('/')[1],
-                })
-          ).status;
-        }),
-      );
+      // If ephemeral, still terminate. If not ephemeral, hibernate.
+      if (ephemeral) {
+        const statuses = await Promise.all(
+          ghRunnerIds.map(async (ghRunnerId) => {
+            return (
+              ec2runner.type === 'Org'
+                ? await githubAppClient.actions.deleteSelfHostedRunnerFromOrg({
+                    runner_id: ghRunnerId,
+                    org: ec2runner.owner,
+                  })
+                : await githubAppClient.actions.deleteSelfHostedRunnerFromRepo({
+                    runner_id: ghRunnerId,
+                    owner: ec2runner.owner.split('/')[0],
+                    repo: ec2runner.owner.split('/')[1],
+                  })
+            ).status;
+          }),
+        );
 
-      if (statuses.every((status) => status == 204)) {
-        await terminateRunner(ec2runner.instanceId);
-        logger.debug(`AWS runner instance '${ec2runner.instanceId}' is terminated and GitHub runner is de-registered.`);
+        if (statuses.every((status) => status == 204)) {
+          await terminateRunner(ec2runner.instanceId);
+          logger.debug(`AWS runner instance '${ec2runner.instanceId}' terminated (ephemeral runner).`);
+        } else {
+          logger.error(`Failed to de-register GitHub runner: ${statuses}`);
+        }
       } else {
-        logger.error(`Failed to de-register GitHub runner: ${statuses}`);
+        // Non-ephemeral runner: Hibernate
+        const statuses = await Promise.all(
+          ghRunnerIds.map(async (ghRunnerId) => {
+            return (
+              ec2runner.type === 'Org'
+                ? await githubAppClient.actions.deleteSelfHostedRunnerFromOrg({
+                    runner_id: ghRunnerId,
+                    org: ec2runner.owner,
+                  })
+                : await githubAppClient.actions.deleteSelfHostedRunnerFromRepo({
+                    runner_id: ghRunnerId,
+                    owner: ec2runner.owner.split('/')[0],
+                    repo: ec2runner.owner.split('/')[1],
+                  })
+            ).status;
+          }),
+        );
+        if (statuses.every((status) => status == 204)) {
+          await hibernateRunner(ec2runner.instanceId);
+          logger.debug(`AWS runner instance '${ec2runner.instanceId}' is hibernated (non-ephemeral runner).`);
+        } else {
+          logger.error(`Failed to de-register GitHub runner before hibernation: ${statuses}`);
+        }
       }
     } else {
       logger.info(`Runner '${ec2runner.instanceId}' cannot be de-registered, because it is still busy.`);
@@ -155,6 +182,8 @@ async function evaluateAndRemoveRunners(
   const evictionStrategy = getEvictionStrategy(scaleDownConfigs);
   const ownerTags = new Set(ec2Runners.map((runner) => runner.owner));
 
+  const ephemeralEnabled = yn(process.env.ENABLE_EPHEMERAL_RUNNERS, { default: false });
+
   for (const ownerTag of ownerTags) {
     const ec2RunnersFiltered = ec2Runners
       .filter((runner) => runner.owner === ownerTag)
@@ -172,16 +201,19 @@ async function evaluateAndRemoveRunners(
       logger.debug(
         `GitHub runners for AWS runner instance: '${ec2Runner.instanceId}': ${JSON.stringify(ghRunnersFiltered)}`,
       );
+      const ephemeral = ephemeralEnabled && process.env.ENABLE_EPHEMERAL_RUNNERS === 'true';
+
       if (ghRunnersFiltered.length) {
         if (runnerMinimumTimeExceeded(ec2Runner)) {
           if (idleCounter > 0) {
             idleCounter--;
             logger.info(`Runner '${ec2Runner.instanceId}' will be kept idle.`);
           } else {
-            logger.info(`Terminating all non busy runners.`);
+            logger.info(`Terminating or hibernating non busy runners.`);
             await removeRunner(
               ec2Runner,
               ghRunnersFiltered.map((runner: { id: number }) => runner.id),
+              ephemeral,
             );
           }
         }
@@ -230,26 +262,18 @@ export function newestFirstStrategy(a: RunnerInfo, b: RunnerInfo): number {
   return oldestFirstStrategy(a, b) * -1;
 }
 
-async function listRunners(environment: string) {
-  return await listEC2Runners({
-    environment,
-  });
-}
-
-function filterRunners(ec2runners: RunnerList[]): RunnerInfo[] {
-  return ec2runners.filter((ec2Runner) => ec2Runner.type && !ec2Runner.orphan) as RunnerInfo[];
-}
-
 export async function scaleDown(): Promise<void> {
   githubCache.reset();
   const environment = process.env.ENVIRONMENT;
   const scaleDownConfigs = JSON.parse(process.env.SCALE_DOWN_CONFIG) as [ScalingDownConfig];
 
-  // first runners marked to be orphan.
+  // first terminate orphan runners
   await terminateOrphan(environment);
 
   // next scale down idle runners with respect to config and mark potential orphans
-  const ec2Runners = await listRunners(environment);
+  const ec2Runners = await listEC2Runners({
+    environment,
+  });
   const activeEc2RunnersCount = ec2Runners.length;
   logger.info(`Found: '${activeEc2RunnersCount}' active GitHub EC2 runner instances before clean-up.`);
   logger.debug(`Active GitHub EC2 runner instances: ${JSON.stringify(ec2Runners)}`);
@@ -259,9 +283,9 @@ export async function scaleDown(): Promise<void> {
     return;
   }
 
-  const runners = filterRunners(ec2Runners);
+  const runners = ec2Runners.filter((ec2Runner) => ec2Runner.type && !ec2Runner.orphan);
   await evaluateAndRemoveRunners(runners, scaleDownConfigs);
 
-  const activeEc2RunnersCountAfter = (await listRunners(environment)).length;
+  const activeEc2RunnersCountAfter = (await listEC2Runners({ environment })).length;
   logger.info(`Found: '${activeEc2RunnersCountAfter}' active GitHub EC2 runners instances after clean-up.`);
 }

@@ -2,13 +2,17 @@ import {
   CreateFleetCommand,
   CreateFleetResult,
   CreateTagsCommand,
+  DefaultTargetCapacityType,
   DescribeInstancesCommand,
   DescribeInstancesResult,
   EC2Client,
   FleetLaunchTemplateOverridesRequest,
   Tag,
   TerminateInstancesCommand,
+  StopInstancesCommand,
+  StartInstancesCommand,
   _InstanceType,
+  Filter,
 } from '@aws-sdk/client-ec2';
 import { createChildLogger } from '@aws-github-runner/aws-powertools-util';
 import { getTracedAWSV3Client, tracer } from '@aws-github-runner/aws-powertools-util';
@@ -167,15 +171,12 @@ async function processFleetResult(
     );
     const errors = fleet.Errors?.flatMap((e) => e.ErrorCode || '') || [];
 
-    // Educated guess of errors that would make sense to retry based on the list
-    // https://docs.aws.amazon.com/AWSEC2/latest/APIReference/errors-overview.html
     const scaleErrors = [
       'UnfulfillableCapacity',
       'MaxSpotInstanceCountExceeded',
       'TargetCapacityLimitExceededException',
       'RequestLimitExceeded',
       'ResourceLimitExceeded',
-      'MaxSpotInstanceCountExceeded',
       'MaxSpotFleetRequestCountExceeded',
       'InsufficientInstanceCapacity',
     ];
@@ -184,7 +185,7 @@ async function processFleetResult(
       errors.some((e) => runnerParameters.onDemandFailoverOnError?.includes(e)) &&
       runnerParameters.ec2instanceCriteria.targetCapacityType === 'spot'
     ) {
-      logger.warn(`Create fleet failed, initatiing fall back to on demand instances.`);
+      logger.warn(`Create fleet failed, initiating fall back to on demand instances.`);
       logger.debug('Create fleet failed.', { data: fleet.Errors });
       const numberOfInstances = runnerParameters.numberOfRunners - instances.length;
       const instancesOnDemand = await createRunner({
@@ -218,12 +219,10 @@ async function getAmiIdOverride(runnerParameters: Runners.RunnerInputParameters)
     return amiIdOverride;
   } catch (e) {
     logger.debug(
-      `Failed to lookup runner AMI ID from SSM parameter: ${runnerParameters.amiIdSsmParameterName}. ` +
-        'Please ensure that the given parameter exists on this region and contains a valid runner AMI ID',
+      `Failed to lookup runner AMI ID from SSM parameter: ${runnerParameters.amiIdSsmParameterName}.`,
       { error: e },
     );
-    throw new Error(`Failed to lookup runner AMI ID from SSM parameter: ${runnerParameters.amiIdSsmParameterName},
-       ${e}`);
+    throw new Error(`Failed to lookup runner AMI ID from SSM parameter: ${runnerParameters.amiIdSsmParameterName}, ${e}`);
   }
 }
 
@@ -244,54 +243,80 @@ async function createInstances(
     tags.push({ Key: 'ghr:trace_id', Value: traceId! });
   }
 
-  let fleet: CreateFleetResult;
-  try {
-    // see for spec https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_CreateFleet.html
-    const createFleetCommand = new CreateFleetCommand({
-      LaunchTemplateConfigs: [
-        {
-          LaunchTemplateSpecification: {
-            LaunchTemplateName: runnerParameters.launchTemplateName,
-            Version: '$Default',
-          },
-          Overrides: generateFleetOverrides(
-            runnerParameters.subnets,
-            runnerParameters.ec2instanceCriteria.instanceTypes,
-            amiIdOverride,
-          ),
+  const createFleetCommand = new CreateFleetCommand({
+    LaunchTemplateConfigs: [
+      {
+        LaunchTemplateSpecification: {
+          LaunchTemplateName: runnerParameters.launchTemplateName,
+          Version: '$Default',
         },
-      ],
-      SpotOptions: {
-        MaxTotalPrice: runnerParameters.ec2instanceCriteria.maxSpotPrice,
-        AllocationStrategy: runnerParameters.ec2instanceCriteria.instanceAllocationStrategy,
+        Overrides: generateFleetOverrides(
+          runnerParameters.subnets,
+          runnerParameters.ec2instanceCriteria.instanceTypes,
+          amiIdOverride,
+        ),
       },
-      TargetCapacitySpecification: {
-        TotalTargetCapacity: runnerParameters.numberOfRunners,
-        DefaultTargetCapacityType: runnerParameters.ec2instanceCriteria.targetCapacityType,
+    ],
+    SpotOptions: {
+      MaxTotalPrice: runnerParameters.ec2instanceCriteria.maxSpotPrice,
+      AllocationStrategy: runnerParameters.ec2instanceCriteria.instanceAllocationStrategy,
+    },
+    TargetCapacitySpecification: {
+      TotalTargetCapacity: runnerParameters.numberOfRunners,
+      DefaultTargetCapacityType: runnerParameters.ec2instanceCriteria.targetCapacityType,
+    },
+    TagSpecifications: [
+      {
+        ResourceType: 'instance',
+        Tags: tags,
       },
-      TagSpecifications: [
-        {
-          ResourceType: 'instance',
-          Tags: tags,
-        },
-        {
-          ResourceType: 'volume',
-          Tags: tags,
-        },
-      ],
-      Type: 'instant',
-    });
-    fleet = await ec2Client.send(createFleetCommand);
-  } catch (e) {
-    logger.warn('Create fleet request failed.', { error: e as Error });
-    throw e;
-  }
-  return fleet;
+      {
+        ResourceType: 'volume',
+        Tags: tags,
+      },
+    ],
+    Type: 'instant',
+  });
+  return await ec2Client.send(createFleetCommand);
 }
 
-// If launchTime is undefined, this will return false
 export function bootTimeExceeded(ec2Runner: { launchTime?: Date }): boolean {
   const runnerBootTimeInMinutes = process.env.RUNNER_BOOT_TIME_IN_MINUTES;
   const launchTimePlusBootTime = moment(ec2Runner.launchTime).utc().add(runnerBootTimeInMinutes, 'minutes');
   return launchTimePlusBootTime < moment(new Date()).utc();
+}
+
+// New: Hibernate the runner instance
+export async function hibernateRunner(instanceId: string): Promise<void> {
+  logger.debug(`Runner '${instanceId}' will be hibernated (stopped with hibernation).`);
+  const ec2 = getTracedAWSV3Client(new EC2Client({ region: process.env.AWS_REGION }));
+  // Note: Stopping an instance that supports hibernation and has hibernation configured will hibernate it.
+  await ec2.send(new StopInstancesCommand({ InstanceIds: [instanceId], Hibernate: true }));
+  await tag(instanceId, [{ Key: 'ghr:hibernated', Value: 'true' }]);
+  logger.debug(`Runner ${instanceId} has been hibernated.`);
+}
+
+// Helper function to resume hibernated instances
+export async function resumeHibernatedInstances(count: number): Promise<string[]> {
+  const ec2 = getTracedAWSV3Client(new EC2Client({ region: process.env.AWS_REGION }));
+  const filters: Filter[] = [
+    { Name: 'instance-state-name', Values: ['stopped'] },
+    { Name: 'tag:ghr:hibernated', Values: ['true'] },
+    { Name: 'tag:ghr:Application', Values: ['github-action-runner'] },
+  ];
+
+  const desc = await ec2.send(new DescribeInstancesCommand({ Filters: filters }));
+  const stoppedInstances = desc.Reservations?.flatMap(r => r.Instances?.map(i => i.InstanceId!) || []) || [];
+
+  const toResume = stoppedInstances.slice(0, count);
+  if (toResume.length > 0) {
+    logger.info(`Resuming hibernated instances: ${toResume.join(',')}`);
+    await ec2.send(new StartInstancesCommand({ InstanceIds: toResume }));
+    // Optionally remove hibernated tag after start
+    for (const instanceId of toResume) {
+      await tag(instanceId, [{Key: 'ghr:hibernated', Value: 'false'}]);
+    }
+  }
+
+  return toResume;
 }
