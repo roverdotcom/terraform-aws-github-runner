@@ -293,6 +293,82 @@ describe('Scale down runners', () => {
         checkNonTerminated(runners);
       });
 
+      it(`Should not terminate a runner that became busy between deregister and post-deregister check.`, async () => {
+        // setup: runner appears idle on first check, deregister succeeds,
+        // but becomes busy on the post-deregister re-check (race condition)
+        const runners = [
+          createRunnerTestData(
+            'race-condition-1',
+            type,
+            MINIMUM_TIME_RUNNING_IN_MINUTES + 1,
+            true,
+            false,
+            false,
+          ),
+        ];
+
+        mockGitHubRunners(runners);
+        mockAwsRunners(runners);
+
+        // First call to getSelfHostedRunnerFor* returns not-busy (pre-deregister check),
+        // second call returns busy (post-deregister re-check)
+        let callCount = 0;
+        const busyCheckMock = () => {
+          callCount++;
+          if (callCount <= 1) {
+            return { data: { busy: false } };
+          }
+          return { data: { busy: true } };
+        };
+        mockOctokit.actions.getSelfHostedRunnerForRepo.mockImplementation(busyCheckMock);
+        mockOctokit.actions.getSelfHostedRunnerForOrg.mockImplementation(busyCheckMock);
+
+        // act
+        await expect(scaleDown()).resolves.not.toThrow();
+
+        // assert: runner should NOT be terminated because it was busy on re-check
+        checkTerminated(runners);
+        checkNonTerminated(runners);
+      });
+
+      it(`Should terminate a runner when post-deregister busy check returns 404.`, async () => {
+        // setup: after deregistration, GitHub API returns 404 for the runner
+        // (runner fully removed). This means it can't be busy, safe to terminate.
+        const runners = [
+          createRunnerTestData(
+            'deregistered-404',
+            type,
+            MINIMUM_TIME_RUNNING_IN_MINUTES + 1,
+            true,
+            false,
+            true,
+          ),
+        ];
+
+        mockGitHubRunners(runners);
+        mockAwsRunners(runners);
+
+        // First call returns not-busy (pre-deregister check),
+        // second call throws 404 (post-deregister, runner is gone)
+        let callCount = 0;
+        const busyCheckMock = () => {
+          callCount++;
+          if (callCount <= 1) {
+            return { data: { busy: false } };
+          }
+          throw new Error('Not Found');
+        };
+        mockOctokit.actions.getSelfHostedRunnerForRepo.mockImplementation(busyCheckMock);
+        mockOctokit.actions.getSelfHostedRunnerForOrg.mockImplementation(busyCheckMock);
+
+        // act
+        await expect(scaleDown()).resolves.not.toThrow();
+
+        // assert: runner should be terminated because 404 means not busy
+        checkTerminated(runners);
+        checkNonTerminated(runners);
+      });
+
       it(`Should terminate orphan.`, async () => {
         // setup
         const orphanRunner = createRunnerTestData('orphan-1', type, MINIMUM_BOOT_TIME + 1, false, false, false);

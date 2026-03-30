@@ -106,39 +106,83 @@ function runnerMinimumTimeExceeded(runner: RunnerInfo): boolean {
 async function removeRunner(ec2runner: RunnerInfo, ghRunnerIds: number[]): Promise<void> {
   const githubAppClient = await getOrCreateOctokit(ec2runner);
   try {
+    // Step 1: Check busy state first as a fast-path to skip busy runners.
     const states = await Promise.all(
       ghRunnerIds.map(async (ghRunnerId) => {
-        // Get busy state instead of using the output of listGitHubRunners(...) to minimize to race condition.
+        // Get busy state instead of using the output of listGitHubRunners(...) to minimize the race condition.
         return await getGitHubRunnerBusyState(githubAppClient, ec2runner, ghRunnerId);
       }),
     );
 
-    if (states.every((busy) => busy === false)) {
-      const statuses = await Promise.all(
-        ghRunnerIds.map(async (ghRunnerId) => {
-          return (
-            ec2runner.type === 'Org'
-              ? await githubAppClient.actions.deleteSelfHostedRunnerFromOrg({
-                  runner_id: ghRunnerId,
-                  org: ec2runner.owner,
-                })
-              : await githubAppClient.actions.deleteSelfHostedRunnerFromRepo({
-                  runner_id: ghRunnerId,
-                  owner: ec2runner.owner.split('/')[0],
-                  repo: ec2runner.owner.split('/')[1],
-                })
-          ).status;
-        }),
-      );
-
-      if (statuses.every((status) => status == 204)) {
-        await terminateRunner(ec2runner.instanceId);
-        logger.debug(`AWS runner instance '${ec2runner.instanceId}' is terminated and GitHub runner is de-registered.`);
-      } else {
-        logger.error(`Failed to de-register GitHub runner: ${statuses}`);
-      }
-    } else {
+    if (!states.every((busy) => busy === false)) {
       logger.info(`Runner '${ec2runner.instanceId}' cannot be de-registered, because it is still busy.`);
+      return;
+    }
+
+    // Step 2: De-register the runner from GitHub. This prevents GitHub from assigning
+    // new jobs to this runner, closing the TOCTOU race window where a job could be
+    // assigned between checking busy state and terminating the instance.
+    const statuses = await Promise.all(
+      ghRunnerIds.map(async (ghRunnerId) => {
+        return (
+          ec2runner.type === 'Org'
+            ? await githubAppClient.actions.deleteSelfHostedRunnerFromOrg({
+                runner_id: ghRunnerId,
+                org: ec2runner.owner,
+              })
+            : await githubAppClient.actions.deleteSelfHostedRunnerFromRepo({
+                runner_id: ghRunnerId,
+                owner: ec2runner.owner.split('/')[0],
+                repo: ec2runner.owner.split('/')[1],
+              })
+        ).status;
+      }),
+    );
+
+    if (!statuses.every((status) => status == 204)) {
+      logger.error(`Failed to de-register GitHub runner: ${statuses}`);
+      return;
+    }
+
+    // Step 3: Re-check busy state after de-registration to catch the race condition.
+    // A job may have been assigned between Step 1 and Step 2. After de-registration,
+    // no NEW jobs can be assigned, so this check is now stable.
+    //
+    // If the runner is busy, the in-flight job will continue to completion using its
+    // job-scoped OAuth token. The runner worker communicates with GitHub using credentials
+    // from the job message, not the runner registration.
+    // See: https://github.com/actions/runner/blob/main/src/Runner.Worker/JobRunner.cs
+    //   - Line 80-95: Worker creates its own VssConnection using job-scoped credentials
+    //   - The worker never checks runner registration status during execution
+    //
+    // We leave the instance running so the job can finish. It will be cleaned up as
+    // an orphan on a subsequent scale-down cycle.
+    const postDeregisterStates = await Promise.all(
+      ghRunnerIds.map(async (ghRunnerId) => {
+        try {
+          return await getGitHubRunnerBusyState(githubAppClient, ec2runner, ghRunnerId);
+        } catch (e) {
+          // The runner was just de-registered, so the GitHub API may 404.
+          // This means GitHub has already fully removed the runner, so it
+          // cannot be busy. Safe to proceed with termination.
+          logger.debug(
+            `Could not re-check busy state for de-registered runner '${ec2runner.instanceId}' ` +
+              `(GitHub Runner ID '${ghRunnerId}'): ${e}. Treating as not busy.`,
+          );
+          return false;
+        }
+      }),
+    );
+
+    if (postDeregisterStates.every((busy) => busy === false)) {
+      await terminateRunner(ec2runner.instanceId);
+      logger.info(`AWS runner instance '${ec2runner.instanceId}' is terminated and GitHub runner is de-registered.`);
+    } else {
+      logger.warn(
+        `Runner '${ec2runner.instanceId}' became busy between idle check and de-registration. ` +
+          `The in-flight job will complete using its job-scoped credentials. ` +
+          `The instance will be cleaned up as an orphan on a subsequent scale-down cycle.`,
+      );
     }
   } catch (e) {
     logger.error(`Runner '${ec2runner.instanceId}' cannot be de-registered. Error: ${e}`, {
